@@ -1,0 +1,760 @@
+/* Demo PDV — Lanchonete Demo (demonstração fictícia)
+ * Sem backend: estado salvo no localStorage deste navegador.
+ * Pix, cartão, gaveta, impressora e app de delivery são SIMULAÇÕES.
+ */
+(function () {
+  'use strict';
+
+  const CHAVE = 'demo-pdv-lanchonete-v1';
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const brl = (c) => 'R$ ' + (c / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const hora = (iso) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const dataHora = (iso) => new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const pad = (n) => String(n).padStart(3, '0');
+  const parseReais = (txt) => {
+    if (!txt) return 0;
+    const v = parseFloat(String(txt).replace(/[^\d,.-]/g, '').replace(/\.(?=\d{3}(\D|$))/g, '').replace(',', '.'));
+    return isNaN(v) ? 0 : Math.round(v * 100);
+  };
+  // 'cartao' = forma antiga (antes da separação débito/crédito), mantida só para exibir dados já salvos
+  const PG = { dinheiro: 'Dinheiro', pix: 'Pix', debito: 'Cartão de Débito', credito: 'Cartão de Crédito', cartao: 'Cartão (registro antigo)' };
+  const PG_CURTO = { dinheiro: 'Dinheiro', pix: 'Pix', debito: 'Débito', credito: 'Crédito', cartao: 'Cartão (antigo)' };
+  const PROD = Object.fromEntries(PRODUTOS.map((p) => [p.id, p]));
+  const ADD = Object.fromEntries(ADICIONAIS.map((a) => [a.id, a]));
+
+  /* ---------- estado ---------- */
+  // vendas = caixa aberto agora; arquivo = vendas de caixas já fechados (usadas nos Relatórios)
+  const novoEstado = () => ({ caixa: null, vendas: [], delivery: [], carrinho: [], fechamentos: [], arquivo: [] });
+  let S;
+  try { S = Object.assign(novoEstado(), JSON.parse(localStorage.getItem(CHAVE)) || {}); }
+  catch (e) { S = novoEstado(); }
+  const salvar = () => { try { localStorage.setItem(CHAVE, JSON.stringify(S)); } catch (e) { /* sem storage: segue em memória */ } };
+
+  let catAtual = 'tradicional';
+  let viewAtual = 'venda';
+  let filtroHist = 'todos';
+
+  /* ---------- relógio ---------- */
+  function tick() {
+    const d = new Date();
+    const h = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    $('#ab-hora').textContent = h;
+    $('#topo-hora').textContent = h;
+    const dt = d.toLocaleDateString('pt-BR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    $('#ab-data').textContent = dt.charAt(0).toUpperCase() + dt.slice(1);
+  }
+  setInterval(tick, 1000); tick();
+
+  /* ---------- abertura ---------- */
+  function mostrarAbertura() {
+    $('#app').hidden = true;
+    $('#abertura').hidden = false;
+    $('#ab-fundo').value = '';
+    $$('#ab-atalhos button').forEach((b) => b.classList.remove('sel'));
+  }
+  $('#ab-atalhos').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    $$('#ab-atalhos button').forEach((x) => x.classList.toggle('sel', x === b));
+    $('#ab-fundo').value = (b.dataset.v / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2 });
+  });
+  $('#ab-fundo').addEventListener('input', () => $$('#ab-atalhos button').forEach((x) => x.classList.remove('sel')));
+  $('#btn-abrir').addEventListener('click', () => {
+    S.caixa = { aberto: true, abertoEm: new Date().toISOString(), fundo: parseReais($('#ab-fundo').value), seq: 0 };
+    if (S.vendas.length) S.arquivo = S.arquivo.concat(S.vendas); // segurança: nunca perder vendas antigas
+    S.vendas = []; S.delivery = []; S.carrinho = [];
+    salvar();
+    entrarApp();
+    toast('Caixa aberto às ' + hora(S.caixa.abertoEm) + ' · fundo de ' + brl(S.caixa.fundo));
+  });
+
+  function entrarApp() {
+    $('#abertura').hidden = true;
+    $('#app').hidden = false;
+    catAtual = 'tradicional';
+    irPara('venda');
+    renderCats(); renderGrade(); renderCarrinho(); renderBadge();
+  }
+
+  /* ---------- navegação ---------- */
+  function irPara(v) {
+    viewAtual = v;
+    $$('#abas button').forEach((b) => b.classList.toggle('ativa', b.dataset.view === v));
+    $$('.view').forEach((s) => (s.hidden = s.id !== 'view-' + v));
+    if (v === 'delivery') renderDelivery();
+    if (v === 'historico') renderHistorico();
+    if (v === 'caixa') renderCaixa();
+    if (v === 'relatorios') renderRelatorios();
+    window.scrollTo(0, 0);
+  }
+  $('#abas').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) irPara(b.dataset.view); });
+
+  /* ---------- catálogo ---------- */
+  function renderCats() {
+    $('#cats').innerHTML = CATEGORIAS.map((c) =>
+      `<button data-cat="${c.id}" class="${c.id === catAtual ? 'ativa' : ''}"><svg><use href="#i-${c.icone}"/></svg>${esc(c.nome)}</button>`
+    ).join('');
+  }
+  $('#cats').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    catAtual = b.dataset.cat; renderCats(); renderGrade();
+  });
+
+  function cardProduto(p) {
+    const cat = CATEGORIAS.find((c) => c.id === p.cat);
+    const semPreco = p.preco == null;
+    return `<button class="prod ${semPreco ? 'sem-preco' : ''}" data-id="${p.id}">
+      <svg><use href="#i-${cat.icone}"/></svg>
+      ${p.adicionais ? '<span class="prod-tag">+ adicionais</span>' : ''}
+      <span class="prod-nome">${esc(p.curto)}</span>
+      ${p.sub ? `<span class="prod-sub">${esc(p.sub)}</span>` : ''}
+      <span class="prod-preco">${semPreco ? 'Preço não definido' : brl(p.preco)}</span>
+    </button>`;
+  }
+  function renderGrade() {
+    const lista = PRODUTOS.filter((p) => p.cat === catAtual);
+    let html = lista.map(cardProduto).join('');
+    if (catAtual === 'adicionais') html = '<p class="secao-titulo">Adicional avulso · para escolher junto do lanche, toque no próprio lanche</p>' + html;
+    $('#grade').innerHTML = html;
+  }
+  $('#grade').addEventListener('click', (e) => {
+    const b = e.target.closest('.prod'); if (!b) return;
+    const p = PROD[b.dataset.id];
+    if (p.preco == null) {
+      toast(`“${p.nome}”: preço não definido nesta demonstração.`);
+      return;
+    }
+    if (p.adicionais) { abrirItem(p); return; }
+    adicionar(p.id, [], 1);
+    b.classList.remove('flash'); void b.offsetWidth; b.classList.add('flash');
+  });
+
+  /* ---------- carrinho ---------- */
+  const chaveLinha = (id, adds) => id + '|' + [...adds].sort().join(',');
+  const precoUnit = (l) => PROD[l.id].preco + l.adds.reduce((s, a) => s + ADD[a].preco, 0);
+  const totalCarrinho = () => S.carrinho.reduce((s, l) => s + precoUnit(l) * l.qtd, 0);
+
+  function adicionar(id, adds, qtd) {
+    const k = chaveLinha(id, adds);
+    const ex = S.carrinho.find((l) => chaveLinha(l.id, l.adds) === k);
+    if (ex) ex.qtd += qtd; else S.carrinho.push({ id, adds: [...adds], qtd });
+    salvar(); renderCarrinho();
+    const bar = $('#barra-pedido'); bar.animate([{ transform: 'scale(1.04)' }, { transform: 'none' }], 250);
+  }
+
+  function renderCarrinho() {
+    const box = $('#pedido-itens');
+    if (!S.carrinho.length) {
+      box.innerHTML = `<div class="vazio"><svg><use href="#i-pao"/></svg><p><b>Nenhum item ainda</b><br>Toque nos produtos para montar o pedido.</p></div>`;
+    } else {
+      box.innerHTML = S.carrinho.map((l, i) => {
+        const p = PROD[l.id];
+        return `<div class="item" data-i="${i}">
+          <div><div class="item-nome">${esc(p.nome)}</div><div class="item-unit">${brl(precoUnit(l))} cada</div></div>
+          <div class="item-valor">${brl(precoUnit(l) * l.qtd)}</div>
+          ${l.adds.length ? `<div class="item-adds">${l.adds.map((a) => `<span>+ ${esc(ADD[a].nome)}</span>`).join('')}</div>` : ''}
+          <div class="item-ctrl">
+            <div class="qtd"><button data-a="menos" aria-label="Diminuir">−</button><b>${l.qtd}</b><button data-a="mais" aria-label="Aumentar">+</button></div>
+            ${p.adicionais ? '<button class="editar" data-a="editar">Adicionais</button>' : ''}
+            <button class="remover" data-a="remover">Remover</button>
+          </div>
+        </div>`;
+      }).join('');
+    }
+    const tot = totalCarrinho();
+    const qtd = S.carrinho.reduce((s, l) => s + l.qtd, 0);
+    $('#ped-subtotal').textContent = brl(tot);
+    $('#ped-total').textContent = brl(tot);
+    $('#ped-num').textContent = '· nº ' + pad((S.caixa ? S.caixa.seq : 0) + 1);
+    $('#btn-finalizar').disabled = !S.carrinho.length;
+    $('#btn-limpar').disabled = !S.carrinho.length;
+    $('#barra-qtd').textContent = qtd;
+    $('#barra-total').textContent = brl(tot);
+    $('#barra-pedido').classList.toggle('vazia', !qtd);
+  }
+  $('#pedido-itens').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    const i = +b.closest('.item').dataset.i; const l = S.carrinho[i];
+    if (b.dataset.a === 'mais') l.qtd++;
+    if (b.dataset.a === 'menos') { l.qtd--; if (l.qtd < 1) S.carrinho.splice(i, 1); }
+    if (b.dataset.a === 'remover') S.carrinho.splice(i, 1);
+    if (b.dataset.a === 'editar') { abrirItem(PROD[l.id], i); return; }
+    salvar(); renderCarrinho();
+  });
+  $('#btn-limpar').addEventListener('click', () => {
+    if (!S.carrinho.length) return;
+    confirmar('Limpar todos os itens do pedido atual?', 'Limpar pedido', () => { S.carrinho = []; salvar(); renderCarrinho(); });
+  });
+  $('#barra-pedido').addEventListener('click', () => $('#pedido').classList.add('aberto'));
+  $('#fechar-sheet').addEventListener('click', () => $('#pedido').classList.remove('aberto'));
+
+  /* ---------- modal genérico ---------- */
+  let aoFechar = null;
+  function abrirModal(html, { largo = false, onClose = null } = {}) {
+    const c = $('#modal-caixa');
+    c.className = 'modal-caixa' + (largo ? ' largo' : '');
+    c.innerHTML = html;
+    $('#modal').hidden = false;
+    aoFechar = onClose;
+  }
+  function fecharModal() {
+    $('#modal').hidden = true; $('#modal-caixa').innerHTML = ''; $('#modal-caixa').onclick = null;
+    const f = aoFechar; aoFechar = null; if (f) f();
+  }
+  $('#modal').addEventListener('click', (e) => { if (e.target.closest('[data-fechar]')) fecharModal(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#modal').hidden) fecharModal(); });
+
+  /* ---------- item com adicionais ---------- */
+  function abrirItem(p, idxEdicao) {
+    const editando = idxEdicao != null;
+    const linha = editando ? S.carrinho[idxEdicao] : null;
+    let adds = new Set(linha ? linha.adds : []);
+    let qtd = linha ? linha.qtd : 1;
+
+    const desenhar = () => {
+      const unit = p.preco + [...adds].reduce((s, a) => s + ADD[a].preco, 0);
+      abrirModal(`
+        <div class="m-topo"><div><h3>${esc(p.nome)}</h3><p>${brl(p.preco)} · escolha os adicionais (opcional)</p></div><button class="m-x" data-fechar aria-label="Fechar">×</button></div>
+        <div class="m-corpo">
+          <div class="rotulo">Adicionais</div>
+          <div class="opcoes">${ADICIONAIS.map((a) => `<button class="opcao ${adds.has(a.id) ? 'sel' : ''}" data-add="${a.id}">${esc(a.nome)}<small>+ ${brl(a.preco)}</small></button>`).join('')}</div>
+          <div class="rotulo">Quantidade</div>
+          <div class="qtd-grande"><button data-q="-1" aria-label="Diminuir">−</button><b>${qtd}</b><button data-q="1" aria-label="Aumentar">+</button></div>
+        </div>
+        <div class="m-rodape">
+          <button class="btn btn-claro" data-fechar>Cancelar</button>
+          <button class="btn btn-vermelho btn-lg" id="m-ok">${editando ? 'Salvar' : 'Adicionar'} · ${brl(unit * qtd)}</button>
+        </div>`);
+      $('#modal-caixa').onclick = (e) => {
+        const a = e.target.closest('[data-add]'); const q = e.target.closest('[data-q]');
+        if (a) { adds.has(a.dataset.add) ? adds.delete(a.dataset.add) : adds.add(a.dataset.add); desenhar(); }
+        if (q) { qtd = Math.max(1, qtd + +q.dataset.q); desenhar(); }
+        if (e.target.closest('#m-ok')) {
+          if (editando) S.carrinho.splice(idxEdicao, 1);
+          adicionar(p.id, [...adds], qtd);
+          $('#modal-caixa').onclick = null;
+          fecharModal();
+        }
+      };
+    };
+    desenhar();
+  }
+
+  /* ---------- finalizar venda / pagamento ---------- */
+  $('#btn-finalizar').addEventListener('click', () => {
+    if (!S.carrinho.length) return;
+    $('#pedido').classList.remove('aberto');
+    abrirPagamento();
+  });
+
+  function abrirPagamento() {
+    const total = totalCarrinho();
+    let forma = null; let recebido = 0;
+
+    const painel = () => {
+      if (forma === 'dinheiro') {
+        const falta = recebido < total;
+        const notas = [total, 1000, 2000, 5000, 10000].filter((v, i, a) => (i === 0 || v > total) && a.indexOf(v) === i);
+        return `<div class="painel-forma">
+          <div class="rotulo" style="margin-top:0">Valor recebido</div>
+          <div class="input-moeda claro"><b>R$</b><input id="pg-recebido" inputmode="decimal" placeholder="0,00" value="${recebido ? (recebido / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2 }) : ''}" autocomplete="off"></div>
+          <div class="atalhos claro" style="margin-top:10px">${notas.map((v, i) => `<button data-nota="${v}">${i === 0 ? 'Valor exato' : brl(v).replace(',00', '')}</button>`).join('')}</div>
+          <div class="troco ${recebido ? (falta ? 'falta' : 'ok') : 'ok'}" id="pg-troco">${trocoHtml()}</div>
+        </div>`;
+      }
+      if (forma === 'pix') return `<div class="painel-forma info-sim"><div class="grande-ico">Pix</div><div><span class="tag-sim">Simulação</span><br>Na versão final, o QR Code de cobrança aparece aqui. Nesta demo, apenas confirme que o Pix foi recebido.</div></div>`;
+      if (forma === 'debito' || forma === 'credito') return `<div class="painel-forma info-sim"><div class="grande-ico">▭</div><div><span class="tag-sim">Simulação</span><br>Passe o cartão na maquininha na função <b>${forma === 'debito' ? 'débito' : 'crédito'}</b>. Nesta demo não há ligação com a maquininha — apenas confirme a aprovação.</div></div>`;
+      return '';
+    };
+    const trocoHtml = () => {
+      if (!recebido) return `<span>Troco</span><b>—</b>`;
+      return recebido < total ? `<span>Faltam</span><b>${brl(total - recebido)}</b>` : `<span>Troco</span><b>${brl(recebido - total)}</b>`;
+    };
+    const podeConfirmar = () => forma && (forma !== 'dinheiro' || recebido >= total);
+
+    const desenhar = () => {
+      abrirModal(`
+        <div class="m-topo"><div><h3>Pagamento</h3><p>Pedido nº ${pad(S.caixa.seq + 1)} · ${S.carrinho.reduce((s, l) => s + l.qtd, 0)} itens</p></div><button class="m-x" data-fechar aria-label="Fechar">×</button></div>
+        <div class="m-corpo">
+          <div class="total-pagar"><small>Total a pagar</small><b>${brl(total)}</b></div>
+          <div class="rotulo">Forma de pagamento</div>
+          <div class="formas">
+            <button class="forma ${forma === 'dinheiro' ? 'sel' : ''}" data-forma="dinheiro"><span class="ico">R$</span>Dinheiro</button>
+            <button class="forma ${forma === 'pix' ? 'sel' : ''}" data-forma="pix"><span class="ico">◆</span>Pix</button>
+            <button class="forma ${forma === 'debito' ? 'sel' : ''}" data-forma="debito"><span class="ico">▭</span>Cartão de Débito</button>
+            <button class="forma ${forma === 'credito' ? 'sel' : ''}" data-forma="credito"><span class="ico">▭</span>Cartão de Crédito</button>
+          </div>
+          ${painel()}
+        </div>
+        <div class="m-rodape">
+          <button class="btn btn-claro" data-fechar>Voltar</button>
+          <button class="btn btn-verde btn-lg" id="pg-ok" ${podeConfirmar() ? '' : 'disabled'}>Confirmar pagamento</button>
+        </div>`);
+      const inp = $('#pg-recebido');
+      if (inp) {
+        inp.addEventListener('input', () => {
+          recebido = parseReais(inp.value);
+          const t = $('#pg-troco'); t.innerHTML = trocoHtml();
+          t.className = 'troco ' + (recebido && recebido < total ? 'falta' : 'ok');
+          $('#pg-ok').disabled = !podeConfirmar();
+        });
+        if (!recebido) setTimeout(() => inp.focus(), 50);
+      }
+    };
+    desenhar();
+
+    $('#modal-caixa').onclick = (e) => {
+      const f = e.target.closest('[data-forma]'); const n = e.target.closest('[data-nota]');
+      if (f) { forma = f.dataset.forma; if (forma !== 'dinheiro') recebido = 0; desenhar(); }
+      if (n) { recebido = +n.dataset.nota; desenhar(); }
+      if (e.target.closest('#pg-ok') && podeConfirmar()) {
+        $('#modal-caixa').onclick = null;
+        const venda = registrarVenda({
+          origem: 'balcao',
+          itens: S.carrinho.map((l) => ({ id: l.id, adds: l.adds, qtd: l.qtd })),
+          pagamento: forma,
+          recebido: forma === 'dinheiro' ? recebido : null,
+          troco: forma === 'dinheiro' ? recebido - total : null
+        });
+        S.carrinho = []; salvar(); renderCarrinho();
+        if (forma === 'dinheiro') mostrarGaveta(venda); else mostrarRecibo(venda, { novaVenda: true });
+      }
+    };
+  }
+
+  function registrarVenda(dados) {
+    S.caixa.seq += 1;
+    const itens = dados.itens.map((i) => ({
+      id: i.id, nome: PROD[i.id].nome, qtd: i.qtd,
+      adds: i.adds.map((a) => ({ id: a, nome: ADD[a].nome, preco: ADD[a].preco })),
+      unit: PROD[i.id].preco + i.adds.reduce((s, a) => s + ADD[a].preco, 0)
+    }));
+    const v = Object.assign({
+      id: Date.now().toString(36) + '-' + S.caixa.seq,
+      num: S.caixa.seq,
+      quando: new Date().toISOString(),
+      itens,
+      total: itens.reduce((s, i) => s + i.unit * i.qtd, 0)
+    }, dados, { itens });
+    S.vendas.push(v); salvar();
+    return v;
+  }
+
+  /* ---------- gaveta (simulação) ---------- */
+  function mostrarGaveta(venda) {
+    abrirModal(`
+      <div class="m-topo"><div><h3>Abrir gaveta do caixa</h3><p>Venda nº ${pad(venda.num)} em dinheiro</p></div></div>
+      <div class="m-corpo">
+        <div class="gaveta-wrap"><div class="registradora" id="reg">
+          <div class="reg-corpo"><div class="reg-visor">${brl(venda.troco).replace('R$ ', '')}</div></div>
+          <div class="reg-gaveta"><i></i><i></i><i></i><i></i></div>
+        </div></div>
+        <div class="gaveta-msg" id="gav-msg">Abrindo gaveta…</div>
+        <div class="gaveta-troco">Entregue o troco<b>${brl(venda.troco)}</b><span style="font-weight:700;font-size:.85rem">Recebido ${brl(venda.recebido)} · Total ${brl(venda.total)}</span></div>
+        <p class="nota-futuro"><span class="tag-sim">Simulação</span> Em um sistema real, a gaveta pode abrir sozinha por comando enviado à impressora térmica.</p>
+      </div>
+      <div class="m-rodape"><button class="btn btn-vermelho btn-lg" id="gav-ok">Troco entregue · ver comprovante</button></div>`);
+    setTimeout(() => { const r = $('#reg'); if (r) { r.classList.add('aberta'); $('#gav-msg').textContent = 'Gaveta aberta'; } }, 350);
+    $('#gav-ok').onclick = () => mostrarRecibo(venda, { novaVenda: true });
+  }
+
+  /* ---------- comprovante térmico ---------- */
+  function reciboHtml(v) {
+    const linhas = v.itens.map((i) => `
+      <div class="l"><span>${i.qtd}x ${esc(i.nome)}</span><span>${brl(i.unit * i.qtd).replace('R$ ', '')}</span></div>
+      ${i.adds.map((a) => `<div class="add">+ ${esc(a.nome)} (${brl(a.preco).replace('R$ ', '')})</div>`).join('')}`).join('');
+    const delivery = v.origem === 'delivery';
+    return `<div class="recibo">
+      <div class="c g">${esc(LOJA.nome.toUpperCase())}</div>
+      <div class="c">Demonstração fictícia</div>
+      <div class="sep"></div>
+      ${delivery ? `<div class="c b">*** COMANDA DELIVERY ***</div><div class="c">App de delivery · pedido ${esc(v.deliveryId)}</div><div class="c">(simulação)</div><div class="sep"></div>` : ''}
+      <div class="l"><span>PEDIDO</span><span class="b">Nº ${pad(v.num)}</span></div>
+      <div class="l"><span>Data/hora</span><span>${dataHora(v.quando)}</span></div>
+      <div class="l"><span>Origem</span><span>${delivery ? 'App de delivery' : 'Balcão'}</span></div>
+      <div class="sep"></div>
+      ${linhas}
+      <div class="sep"></div>
+      <div class="l tot"><span>TOTAL</span><span>${brl(v.total)}</span></div>
+      <div class="l"><span>Pagamento</span><span>${PG[v.pagamento] || v.pagamento}${delivery ? ' (app)' : ''}</span></div>
+      ${v.recebido != null ? `<div class="l"><span>Recebido</span><span>${brl(v.recebido)}</span></div><div class="l b"><span>Troco</span><span>${brl(v.troco)}</span></div>` : ''}
+      <div class="sep"></div>
+      <div class="c">${esc(LOJA.rodape)}</div>
+      <div class="c" style="margin-top:6px;font-size:11px">DOCUMENTO NÃO FISCAL<br>Demonstração Vortyx</div>
+    </div>`;
+  }
+
+  function imprimir(html) {
+    if (window.PDV_IMPRESSAO_SIMULADA) { toast('Enviado para a impressora térmica (simulação nesta prévia online)'); return; }
+    $('#area-impressao').innerHTML = html;
+    setTimeout(() => window.print(), 50);
+  }
+
+  function mostrarRecibo(v, { novaVenda = false } = {}) {
+    const delivery = v.origem === 'delivery';
+    abrirModal(`
+      <div class="m-topo"><div><h3>${novaVenda ? (delivery ? 'Pedido aceito' : 'Venda concluída') : 'Comprovante'} · nº ${pad(v.num)}</h3><p>${brl(v.total)} · ${PG[v.pagamento] || v.pagamento} · ${delivery ? 'App de delivery' : 'Balcão'}</p></div><button class="m-x" data-fechar aria-label="Fechar">×</button></div>
+      <div class="m-corpo"><div class="recibo-palco">${reciboHtml(v)}</div></div>
+      <div class="m-rodape">
+        <button class="btn btn-claro btn-lg" id="rc-print">${delivery ? 'Imprimir comanda' : 'Imprimir comprovante'}</button>
+        <button class="btn btn-vermelho btn-lg" data-fechar>${novaVenda && !delivery ? 'Próxima venda' : 'Fechar'}</button>
+      </div>`, { onClose: novaVenda && !delivery ? () => irPara('venda') : null });
+    $('#rc-print').onclick = () => imprimir(reciboHtml(v));
+  }
+
+  /* ---------- App de delivery (simulação) ---------- */
+  const sorteia = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  function gerarPedidoDelivery() {
+    const vendaveis = PRODUTOS.filter((p) => p.preco != null && p.cat !== 'adicionais');
+    const pqs = vendaveis.filter((p) => p.adicionais);
+    const bebidas = vendaveis.filter((p) => p.cat === 'bebidas' || p.cat === 'sucos');
+    const itens = [];
+    const n = 1 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < n; i++) {
+      const p = sorteia(pqs);
+      const adds = Math.random() < 0.6 ? [sorteia(ADICIONAIS).id] : [];
+      itens.push({ id: p.id, adds, qtd: 1 + Math.floor(Math.random() * 2) });
+    }
+    if (Math.random() < 0.85) itens.push({ id: sorteia(bebidas).id, adds: [], qtd: 1 });
+    if (Math.random() < 0.3) itens.push({ id: sorteia(vendaveis.filter((p) => p.cat === 'doces')).id, adds: [], qtd: 1 });
+    const total = itens.reduce((s, i) => s + (PROD[i.id].preco + i.adds.reduce((x, a) => x + ADD[a].preco, 0)) * i.qtd, 0);
+    return {
+      deliveryId: 'DL-' + String(Math.floor(100000 + Math.random() * 900000)),
+      chegou: new Date().toISOString(),
+      itens, total,
+      pagamento: sorteia(['pix', 'debito', 'credito'])
+    };
+  }
+
+  function bip() {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      [0, 0.22].forEach((t) => {
+        const o = ctx.createOscillator(); const g = ctx.createGain();
+        o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+        g.gain.setValueAtTime(0.0001, ctx.currentTime + t);
+        g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.18);
+        o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.2);
+      });
+    } catch (e) { /* sem áudio */ }
+  }
+
+  $('#btn-sim-delivery').addEventListener('click', () => {
+    const p = gerarPedidoDelivery();
+    S.delivery.unshift(p); salvar();
+    renderDelivery(); renderBadge(); bip();
+    toast('Novo pedido do app de delivery ' + p.deliveryId + ' · ' + brl(p.total));
+  });
+
+  function renderBadge() {
+    const n = S.delivery.length; const b = $('#badge-delivery');
+    b.hidden = !n; b.textContent = n;
+  }
+
+  function renderDelivery() {
+    const box = $('#delivery-lista');
+    if (!S.delivery.length) {
+      box.innerHTML = `<div class="vazio-delivery"><svg><use href="#i-moto"/></svg><p>Nenhum pedido de delivery aguardando.<br>Toque em <b>“Simular novo pedido do app”</b> para ver como ele chega no caixa.</p></div>`;
+      return;
+    }
+    box.innerHTML = S.delivery.map((p, i) => `
+      <article class="kcard">
+        <div class="kcard-topo"><b>App de delivery · ${esc(p.deliveryId)}</b><span class="kcard-novo">Novo pedido</span></div>
+        <div class="kcard-corpo">
+          <div class="kcard-meta"><span>Recebido às ${hora(p.chegou)}</span><span>Pagamento: ${PG[p.pagamento] || p.pagamento} (pago no app · simulado)</span></div>
+          ${p.itens.map((it) => `<div class="kitem"><span>${it.qtd}x ${esc(PROD[it.id].nome)}${it.adds.map((a) => `<small>+ ${esc(ADD[a].nome)}</small>`).join('')}</span><span>${brl((PROD[it.id].preco + it.adds.reduce((x, a) => x + ADD[a].preco, 0)) * it.qtd)}</span></div>`).join('')}
+          <div class="ktotal"><span>Total</span><span>${brl(p.total)}</span></div>
+        </div>
+        <div class="kcard-acoes">
+          <button class="btn btn-claro" data-recusar="${i}">Recusar</button>
+          <button class="btn btn-verde btn-lg" data-aceitar="${i}">Aceitar e imprimir</button>
+        </div>
+      </article>`).join('');
+  }
+  $('#delivery-lista').addEventListener('click', (e) => {
+    const a = e.target.closest('[data-aceitar]'); const r = e.target.closest('[data-recusar]');
+    if (r) {
+      const idx = +r.dataset.recusar;
+      confirmar('Recusar este pedido simulado?', 'Recusar pedido', () => {
+        S.delivery.splice(idx, 1); salvar(); renderDelivery(); renderBadge();
+        toast('Pedido recusado (simulação)');
+      });
+    }
+    if (a) {
+      const p = S.delivery.splice(+a.dataset.aceitar, 1)[0];
+      const v = registrarVenda({ origem: 'delivery', deliveryId: p.deliveryId, itens: p.itens, pagamento: p.pagamento, recebido: null, troco: null });
+      salvar(); renderDelivery(); renderBadge(); renderCarrinho();
+      mostrarRecibo(v, { novaVenda: true });
+    }
+  });
+
+  /* ---------- histórico ---------- */
+  $('#hist-filtros').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    filtroHist = b.dataset.f;
+    $$('#hist-filtros button').forEach((x) => x.classList.toggle('ativo', x === b));
+    renderHistorico();
+  });
+  function renderHistorico() {
+    const lista = S.vendas.filter((v) => filtroHist === 'todos' || v.origem === filtroHist).slice().reverse();
+    const tot = lista.reduce((s, v) => s + v.total, 0);
+    $('#hist-resumo').innerHTML = `<span>Pedidos: <b>${lista.length}</b></span><span>Total: <b>${brl(tot)}</b></span>`;
+    if (!lista.length) { $('#hist-lista').innerHTML = `<div class="vazio">Nenhuma venda ${filtroHist === 'todos' ? 'nesta sessão' : 'com essa origem'} ainda.</div>`; return; }
+    $('#hist-lista').innerHTML = `<div class="hrow cab"><span>Horário</span><span>Pedido</span><span>Itens</span><span>Origem / pagamento</span><span style="text-align:right">Valor</span><span></span></div>` +
+      lista.map((v) => `<button class="hrow" data-num="${v.num}">
+        <span class="hora">${hora(v.quando)}</span>
+        <span class="num">Nº ${pad(v.num)}</span>
+        <span class="itens-resumo">${v.itens.map((i) => i.qtd + 'x ' + esc(PROD[i.id] ? PROD[i.id].curto : i.nome)).join(', ')}</span>
+        <span class="origem-cel"><span class="origem ${v.origem}">${v.origem === 'delivery' ? 'App de delivery' : 'Balcão'}</span> <span class="pg">${PG_CURTO[v.pagamento] || v.pagamento}</span></span>
+        <span class="valor pgv">${brl(v.total)}</span>
+        <span class="seta">›</span>
+      </button>`).join('');
+  }
+  $('#hist-lista').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-num]'); if (!b) return;
+    mostrarRecibo(S.vendas.find((v) => v.num === +b.dataset.num));
+  });
+
+  /* ---------- caixa do dia ---------- */
+  function resumo() {
+    const soma = (f) => S.vendas.filter(f).reduce((s, v) => s + v.total, 0);
+    const conta = (f) => S.vendas.filter(f).length;
+    return {
+      total: soma(() => true), pedidos: S.vendas.length,
+      dinheiro: soma((v) => v.pagamento === 'dinheiro'), pix: soma((v) => v.pagamento === 'pix'), debito: soma((v) => v.pagamento === 'debito'), credito: soma((v) => v.pagamento === 'credito'),
+      cartao: soma((v) => v.pagamento === 'cartao'),
+      balcao: soma((v) => v.origem === 'balcao'), delivery: soma((v) => v.origem === 'delivery'),
+      nBalcao: conta((v) => v.origem === 'balcao'), nDelivery: conta((v) => v.origem === 'delivery'),
+      dinheiroBalcao: soma((v) => v.pagamento === 'dinheiro' && v.origem === 'balcao')
+    };
+  }
+  const barra = (cls, nome, val, max, extra = '') => `<div class="barra ${cls}"><div class="barra-lin"><span>${nome}${extra}</span><span>${brl(val)}</span></div><div class="barra-trilho"><i style="width:${max ? Math.round((val / max) * 100) : 0}%"></i></div></div>`;
+
+  function renderCaixa() {
+    const r = resumo();
+    $('#cx-abertura').textContent = `Aberto às ${hora(S.caixa.abertoEm)} · fundo de troco ${brl(S.caixa.fundo)}`;
+    $('#kpis').innerHTML = `
+      <div class="kpi destaque"><small>Total vendido hoje · ${r.pedidos} pedido${r.pedidos === 1 ? '' : 's'}</small><b>${brl(r.total)}</b></div>
+      <div class="kpi"><small>Vendas no balcão</small><b>${brl(r.balcao)}</b></div>
+      <div class="kpi"><small>Vendas pelo app de delivery</small><b>${brl(r.delivery)}</b></div>
+      <div class="kpi"><small>Dinheiro</small><b>${brl(r.dinheiro)}</b></div>
+      <div class="kpi"><small>Pix</small><b>${brl(r.pix)}</b></div>
+      <div class="kpi"><small>Débito</small><b>${brl(r.debito)}</b></div>
+      <div class="kpi"><small>Crédito</small><b>${brl(r.credito)}</b></div>
+      ${r.cartao ? `<div class="kpi"><small>Cartão (registro antigo)</small><b>${brl(r.cartao)}</b></div>` : ''}
+`;
+    $('#cx-pagamentos').innerHTML = `<h3>Por forma de pagamento</h3>
+      ${barra('dinheiro', 'Dinheiro', r.dinheiro, r.total)}${barra('pix', 'Pix', r.pix, r.total)}${barra('debito', 'Débito', r.debito, r.total)}${barra('credito', 'Crédito', r.credito, r.total)}${r.cartao ? barra('cartao', 'Cartão (registro antigo)', r.cartao, r.total) : ''}
+      <div class="gaveta-esperada"><span>Dinheiro esperado na gaveta</span><span>${brl(S.caixa.fundo + r.dinheiroBalcao)}</span></div>`;
+    $('#cx-origens').innerHTML = `<h3>Por origem</h3>
+      ${barra('balcao', 'Balcão', r.balcao, r.total, ` · ${r.nBalcao} pedido${r.nBalcao === 1 ? '' : 's'}`)}
+      ${barra('delivery', 'App de delivery', r.delivery, r.total, ` · ${r.nDelivery} pedido${r.nDelivery === 1 ? '' : 's'}`)}
+      <p class="muted" style="font-size:.85rem">Pedidos do app de delivery desta demo são simulados.</p>`;
+  }
+
+  function fechamentoHtml(f) {
+    const r = f.resumo;
+    const L = (a, b, cls = '') => `<div class="l ${cls}"><span>${a}</span><span>${b}</span></div>`;
+    return `<div class="recibo">
+      <div class="c g">${esc(LOJA.nome.toUpperCase())}</div>
+      <div class="c b">FECHAMENTO DE CAIXA</div>
+      <div class="sep"></div>
+      ${L('Abertura', dataHora(f.abertoEm))}${L('Fechamento', dataHora(f.fechadoEm))}
+      <div class="sep"></div>
+      ${L('Pedidos', r.pedidos)}${L('  Balcão', r.nBalcao)}${L('  App de delivery', r.nDelivery)}
+      <div class="sep"></div>
+      ${L('Dinheiro', brl(r.dinheiro))}${L('Pix', brl(r.pix))}${L('Débito', brl(r.debito || 0))}${L('Crédito', brl(r.credito || 0))}${r.cartao ? L('Cartão (antigo)', brl(r.cartao)) : ''}
+      <div class="sep"></div>
+      ${L('Balcão', brl(r.balcao))}${L('App de delivery', brl(r.delivery))}
+      <div class="sep"></div>
+      ${L('TOTAL VENDIDO', brl(r.total), 'tot')}
+      <div class="sep"></div>
+      ${L('Fundo de troco', brl(f.fundo))}${L('Esperado na gaveta', brl(f.esperado), 'b')}
+      ${f.contado != null ? L('Contado na gaveta', brl(f.contado)) + L('Diferença', brl(f.contado - f.esperado), 'b') : ''}
+      <div class="sep"></div>
+      <div class="c" style="font-size:11px">DOCUMENTO NÃO FISCAL<br>Demonstração Vortyx</div>
+    </div>`;
+  }
+
+  $('#btn-fechar-caixa').addEventListener('click', () => {
+    const r = resumo();
+    const esperado = S.caixa.fundo + r.dinheiroBalcao;
+    abrirModal(`
+      <div class="m-topo"><div><h3>Fechar caixa</h3><p>${r.pedidos} pedidos · ${brl(r.total)} vendidos</p></div><button class="m-x" data-fechar aria-label="Fechar">×</button></div>
+      <div class="m-corpo">
+        ${S.delivery.length ? `<div class="aviso-sim" style="margin-bottom:12px"><svg><use href="#i-info"/></svg><p>Há ${S.delivery.length} pedido(s) do app de delivery não aceitos. Eles serão descartados.</p></div>` : ''}
+        ${S.carrinho.length ? `<div class="aviso-sim" style="margin-bottom:12px"><svg><use href="#i-info"/></svg><p>O pedido em andamento será descartado.</p></div>` : ''}
+        <div class="gaveta-esperada" style="margin-bottom:12px"><span>Dinheiro esperado na gaveta</span><span>${brl(esperado)}</span></div>
+        <label class="campo" style="color:var(--marrom)"><span>Quanto tem na gaveta agora? <small style="color:var(--suave)">(opcional)</small></span>
+          <div class="input-moeda claro"><b>R$</b><input id="fc-contado" inputmode="decimal" placeholder="0,00" autocomplete="off"></div></label>
+      </div>
+      <div class="m-rodape"><button class="btn btn-claro" data-fechar>Cancelar</button><button class="btn btn-vermelho btn-lg" id="fc-ok">Fechar caixa e gerar resumo</button></div>`);
+    $('#fc-ok').onclick = () => {
+      const txt = $('#fc-contado').value.trim();
+      const f = { abertoEm: S.caixa.abertoEm, fechadoEm: new Date().toISOString(), fundo: S.caixa.fundo, esperado, contado: txt ? parseReais(txt) : null, resumo: r };
+      S.fechamentos.push(f);
+      S.arquivo = S.arquivo.concat(S.vendas); // guarda as vendas para os Relatórios
+      S.caixa = null; S.vendas = []; S.delivery = []; S.carrinho = [];
+      salvar();
+      const html = fechamentoHtml(f);
+      abrirModal(`
+        <div class="m-topo"><div><h3>Caixa fechado</h3><p>Resumo do dia · ${brl(r.total)}</p></div></div>
+        <div class="m-corpo"><div class="recibo-palco">${html}</div></div>
+        <div class="m-rodape"><button class="btn btn-claro btn-lg" id="fc-print">Imprimir resumo</button><button class="btn btn-vermelho btn-lg" data-fechar>Concluir</button></div>`,
+        { onClose: mostrarAbertura });
+      $('#fc-print').onclick = () => imprimir(html);
+    };
+  });
+
+  $('#btn-limpar-demo').addEventListener('click', () => {
+    confirmar('Apagar todas as vendas, pedidos e fechamentos desta demonstração neste navegador?', 'Apagar dados', () => {
+      try { localStorage.removeItem(CHAVE); } catch (e) { /* ok */ }
+      S = novoEstado(); mostrarAbertura();
+    });
+  });
+
+
+  /* ---------- relatórios por período ----------
+   * Usa somente as vendas salvas neste navegador (arquivo de caixas fechados + caixa aberto).
+   * Em um sistema real estes dados viriam de um banco de dados (histórico longo, backup, vários aparelhos).
+   */
+  const rel = { periodo: 'hoje', de: null, ate: null, origem: 'todas', pg: 'todos', lista: [] };
+  const inicioDia = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const fimDia = (d) => { const x = new Date(d); x.setHours(23, 59, 59, 999); return x; };
+  const isoData = (d) => { const x = new Date(d); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); };
+  const dataBR = (d) => new Date(d).toLocaleDateString('pt-BR');
+  const lerDataInput = (v) => { const [a, m, d] = v.split('-').map(Number); return new Date(a, m - 1, d); };
+
+  function intervaloRel() {
+    const hoje = new Date();
+    if (rel.periodo === 'custom') return { ini: inicioDia(rel.de), fim: fimDia(rel.ate) };
+    const dias = rel.periodo === 'hoje' ? 1 : +rel.periodo;
+    const ini = inicioDia(hoje); ini.setDate(ini.getDate() - (dias - 1));
+    return { ini, fim: fimDia(hoje) };
+  }
+  function vendasRel() {
+    const { ini, fim } = intervaloRel();
+    return (S.arquivo || []).concat(S.vendas || [])
+      .filter((v) => { const t = new Date(v.quando); return t >= ini && t <= fim; })
+      .sort((a, b) => new Date(b.quando) - new Date(a.quando));
+  }
+
+  $('#rel-periodos').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    rel.periodo = b.dataset.p;
+    if (rel.periodo === 'custom' && !rel.de) {
+      const h = new Date(); const i = new Date(); i.setDate(i.getDate() - 6);
+      rel.de = i; rel.ate = h; $('#rel-de').value = isoData(i); $('#rel-ate').value = isoData(h);
+    }
+    renderRelatorios();
+  });
+  $('#rel-aplicar').addEventListener('click', () => {
+    const de = $('#rel-de').value, ate = $('#rel-ate').value;
+    if (!de || !ate) { toast('Escolha a data inicial e a data final.'); return; }
+    if (de > ate) { toast('A data inicial precisa ser antes da data final.'); return; }
+    rel.de = lerDataInput(de); rel.ate = lerDataInput(ate); renderRelatorios();
+  });
+  $('#rel-f-origem').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; rel.origem = b.dataset.f; renderRelatorios(); });
+  $('#rel-f-pg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; rel.pg = b.dataset.f; renderRelatorios(); });
+  $('#rel-lista').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-k]'); if (!b) return;
+    mostrarRecibo(rel.lista[+b.dataset.k]);
+  });
+
+  function renderRelatorios() {
+    $$('#rel-periodos button').forEach((b) => b.classList.toggle('ativo', b.dataset.p === rel.periodo));
+    $$('#rel-f-origem button').forEach((b) => b.classList.toggle('ativo', b.dataset.f === rel.origem));
+    $$('#rel-f-pg button').forEach((b) => b.classList.toggle('ativo', b.dataset.f === rel.pg));
+    $('#rel-custom').hidden = rel.periodo !== 'custom';
+    const { ini, fim } = intervaloRel();
+    $('#rel-periodo-txt').textContent = isoData(ini) === isoData(fim) ? dataBR(ini) : `${dataBR(ini)} a ${dataBR(fim)}`;
+
+    const vs = vendasRel();
+    const soma = (f) => vs.filter(f).reduce((s, v) => s + v.total, 0);
+    const conta = (f) => vs.filter(f).length;
+    const total = soma(() => true), n = vs.length;
+    const nB = conta((v) => v.origem === 'balcao'), nK = conta((v) => v.origem === 'delivery');
+
+    // produtos
+    const prods = {}; const adds = {};
+    vs.forEach((v) => v.itens.forEach((i) => {
+      const k = i.id || i.nome; const p = prods[k] || (prods[k] = { nome: (PROD[i.id] && PROD[i.id].nome) || i.nome, qtd: 0, valor: 0 });
+      p.qtd += i.qtd; p.valor += i.unit * i.qtd;
+      (i.adds || []).forEach((a) => { adds[a.nome] = (adds[a.nome] || 0) + i.qtd; });
+    }));
+    const ranking = Object.values(prods).sort((a, b) => b.qtd - a.qtd || b.valor - a.valor || a.nome.localeCompare(b.nome));
+    const topo = ranking.length ? ranking.filter((p) => p.qtd === ranking[0].qtd) : [];
+    const sub = (t) => `<span class="kpi-sub">${t}</span>`;
+    const pl = (x, s1, s2) => x + ' ' + (x === 1 ? s1 : s2);
+
+    $('#rel-kpis').innerHTML = `
+      <div class="kpi destaque"><small>Faturamento do período</small><b>${brl(total)}</b></div>
+      <div class="kpi"><small>Vendas</small><b>${n}</b></div>
+      <div class="kpi"><small>Ticket médio</small><b>${brl(n ? Math.round(total / n) : 0)}</b></div>
+      <div class="kpi"><small>Balcão</small><b>${brl(soma((v) => v.origem === 'balcao'))}</b>${sub(pl(nB, 'pedido', 'pedidos'))}</div>
+      <div class="kpi"><small>App de delivery</small><b>${brl(soma((v) => v.origem === 'delivery'))}</b>${sub(pl(nK, 'pedido', 'pedidos'))}</div>
+      <div class="kpi"><small>Dinheiro</small><b>${brl(soma((v) => v.pagamento === 'dinheiro'))}</b></div>
+      <div class="kpi"><small>Pix</small><b>${brl(soma((v) => v.pagamento === 'pix'))}</b></div>
+      <div class="kpi"><small>Débito</small><b>${brl(soma((v) => v.pagamento === 'debito'))}</b></div>
+      <div class="kpi"><small>Crédito</small><b>${brl(soma((v) => v.pagamento === 'credito'))}</b></div>
+      <div class="kpi kpi-largo"><small>Produto mais vendido</small><b class="kpi-texto">${!topo.length ? '—' : topo.length > 2 ? `${topo.length} produtos empatados` : esc(topo.map((p) => p.nome).join(' e '))}</b>${topo.length ? sub(pl(topo[0].qtd, 'unidade', 'unidades') + (topo.length > 1 ? ' cada (empate)' : '')) : ''}</div>`;
+
+    // conferência: forma x origem
+    const formas = ['dinheiro', 'pix', 'debito', 'credito'].concat(vs.some((v) => v.pagamento === 'cartao') ? ['cartao'] : []);
+    const cel = (f, o) => soma((v) => v.pagamento === f && (!o || v.origem === o));
+    $('#rel-conferencia').innerHTML = `<h3>Conferência por forma de pagamento</h3>
+      <div class="tabela-rolagem"><table class="conf">
+        <thead><tr><th>Forma</th><th>Balcão</th><th>App de delivery</th><th>Total</th></tr></thead>
+        <tbody>${formas.map((f) => `<tr class="${f === 'debito' || f === 'credito' ? 'maq' : ''}"><td>${PG_CURTO[f]}</td><td>${brl(cel(f, 'balcao'))}</td><td>${brl(cel(f, 'delivery'))}</td><td><b>${brl(cel(f))}</b></td></tr>`).join('')}</tbody>
+        <tfoot><tr><td>Total</td><td>${brl(soma((v) => v.origem === 'balcao'))}</td><td>${brl(soma((v) => v.origem === 'delivery'))}</td><td>${brl(total)}</td></tr></tfoot>
+      </table></div>
+      <p class="muted conf-nota">Para conferir com a maquininha, compare as linhas <b>Débito</b> e <b>Crédito</b> da coluna Balcão. Nesta demo, os pedidos do app de delivery são pagos no próprio app e não passam pela maquininha.</p>`;
+
+    const listaAdds = Object.entries(adds).sort((a, b) => b[1] - a[1]);
+    $('#rel-produtos').innerHTML = `<h3>Quantidade vendida por produto</h3>
+      ${ranking.length ? `<div class="tabela-rolagem"><table class="conf conf-prod">
+        <thead><tr><th>Produto</th><th>Qtd</th><th>Valor*</th></tr></thead>
+        <tbody>${ranking.map((p) => `<tr><td>${esc(p.nome)}</td><td>${p.qtd}</td><td>${brl(p.valor)}</td></tr>`).join('')}</tbody>
+      </table></div>
+      ${listaAdds.length ? `<p class="rel-adds"><b>Adicionais:</b> ${listaAdds.map(([k, q]) => `${esc(k)} ${q}`).join(' · ')}</p>` : ''}
+      <p class="muted conf-nota">*Valor inclui os adicionais escolhidos no item.</p>` : '<p class="muted">Nenhuma venda neste período.</p>'}`;
+
+    // lista filtrada
+    rel.lista = vs.filter((v) => (rel.origem === 'todas' || v.origem === rel.origem) && (rel.pg === 'todos' || v.pagamento === rel.pg));
+    const tl = rel.lista.reduce((s, v) => s + v.total, 0);
+    $('#rel-lista-resumo').textContent = `${pl(rel.lista.length, 'venda', 'vendas')} · ${brl(tl)}`;
+    $('#rel-lista').innerHTML = !rel.lista.length ? `<div class="vazio">Nenhuma venda ${n ? 'com esses filtros' : 'registrada neste período'}.</div>` :
+      `<div class="hrow rrow cab"><span>Data</span><span>Hora</span><span>Pedido</span><span>Origem</span><span>Pagamento</span><span style="text-align:right">Valor</span><span></span></div>` +
+      rel.lista.map((v, k) => `<button class="hrow rrow" data-k="${k}">
+        <span class="r-data">${dataBR(v.quando)}</span>
+        <span class="hora">${hora(v.quando)}</span>
+        <span class="num">Nº ${pad(v.num)}</span>
+        <span class="r-origem"><span class="origem ${v.origem}">${v.origem === 'delivery' ? 'App de delivery' : 'Balcão'}</span></span>
+        <span class="pg">${PG_CURTO[v.pagamento] || v.pagamento}</span>
+        <span class="valor">${brl(v.total)}</span>
+        <span class="seta">›</span>
+      </button>`).join('');
+  }
+
+  /* ---------- confirmação dentro da página ---------- */
+  function confirmar(msg, ok, acao) {
+    abrirModal(`
+      <div class="m-topo"><div><h3>Confirmar</h3><p>${esc(msg)}</p></div></div>
+      <div class="m-rodape"><button class="btn btn-claro" data-fechar>Cancelar</button><button class="btn btn-vermelho btn-lg" id="cf-ok">${esc(ok)}</button></div>`);
+    $('#cf-ok').onclick = () => { fecharModal(); acao(); };
+  }
+
+  /* ---------- toast ---------- */
+  let tTimer;
+  function toast(msg) {
+    const t = $('#toast');
+    t.innerHTML = `<span>${esc(msg)}</span>`;
+    t.hidden = false;
+    clearTimeout(tTimer); tTimer = setTimeout(() => (t.hidden = true), 3200);
+  }
+
+  /* ---------- início ---------- */
+  if (S.caixa && S.caixa.aberto) entrarApp(); else mostrarAbertura();
+})();
